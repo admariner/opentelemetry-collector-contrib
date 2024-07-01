@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/sumologicextension"
@@ -54,10 +55,11 @@ type sumologicexporter struct {
 	stickySessionCookieLock sync.RWMutex
 	stickySessionCookie     string
 
-	id component.ID
+	id     component.ID
+	sender *sender
 }
 
-func initExporter(cfg *Config, createSettings exporter.CreateSettings) *sumologicexporter {
+func initExporter(cfg *Config, createSettings exporter.Settings) *sumologicexporter {
 	se := &sumologicexporter{
 		config: cfg,
 		logger: createSettings.Logger,
@@ -78,7 +80,7 @@ func initExporter(cfg *Config, createSettings exporter.CreateSettings) *sumologi
 
 func newLogsExporter(
 	ctx context.Context,
-	params exporter.CreateSettings,
+	params exporter.Settings,
 	cfg *Config,
 ) (exporter.Logs, error) {
 	se := initExporter(cfg, params)
@@ -100,7 +102,7 @@ func newLogsExporter(
 
 func newMetricsExporter(
 	ctx context.Context,
-	params exporter.CreateSettings,
+	params exporter.Settings,
 	cfg *Config,
 ) (exporter.Metrics, error) {
 	se := initExporter(cfg, params)
@@ -110,6 +112,28 @@ func newMetricsExporter(
 		params,
 		cfg,
 		se.pushMetricsData,
+		// Disable exporterhelper Timeout, since we are using a custom mechanism
+		// within exporter itself
+		exporterhelper.WithTimeout(exporterhelper.TimeoutSettings{Timeout: 0}),
+		exporterhelper.WithRetry(cfg.BackOffConfig),
+		exporterhelper.WithQueue(cfg.QueueSettings),
+		exporterhelper.WithStart(se.start),
+		exporterhelper.WithShutdown(se.shutdown),
+	)
+}
+
+func newTracesExporter(
+	ctx context.Context,
+	params exporter.Settings,
+	cfg *Config,
+) (exporter.Traces, error) {
+	se := initExporter(cfg, params)
+
+	return exporterhelper.NewTracesExporter(
+		ctx,
+		params,
+		cfg,
+		se.pushTracesData,
 		// Disable exporterhelper Timeout, since we are using a custom mechanism
 		// within exporter itself
 		exporterhelper.WithTimeout(exporterhelper.TimeoutSettings{Timeout: 0}),
@@ -131,10 +155,6 @@ func (se *sumologicexporter) configure(ctx context.Context) error {
 		ext          *sumologicextension.SumologicExtension
 		foundSumoExt bool
 	)
-
-	if se.config.CompressEncoding != NoCompression {
-		se.config.ClientConfig.Compression = se.config.CompressEncoding
-	}
 
 	httpSettings := se.config.ClientConfig
 
@@ -210,6 +230,21 @@ func (se *sumologicexporter) configure(ctx context.Context) error {
 	}
 
 	se.setHTTPClient(client)
+
+	logsURL, metricsURL, tracesURL := se.getDataURLs()
+	se.sender = newSender(
+		se.logger,
+		se.config,
+		se.getHTTPClient(),
+		se.prometheusFormatter,
+		metricsURL,
+		logsURL,
+		tracesURL,
+		se.StickySessionCookie,
+		se.SetStickySessionCookie,
+		se.id,
+	)
+
 	return nil
 }
 
@@ -246,23 +281,9 @@ func (se *sumologicexporter) shutdown(context.Context) error {
 // It returns the number of unsent logs and an error which contains a list of dropped records
 // so they can be handled by OTC retry mechanism
 func (se *sumologicexporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
-	logsURL, metricsURL, tracesURL := se.getDataURLs()
-	sdr := newSender(
-		se.logger,
-		se.config,
-		se.getHTTPClient(),
-		se.prometheusFormatter,
-		metricsURL,
-		logsURL,
-		tracesURL,
-		se.StickySessionCookie,
-		se.SetStickySessionCookie,
-		se.id,
-	)
-
 	// Follow different execution path for OTLP format
-	if sdr.config.LogFormat == OTLPLogFormat {
-		if err := sdr.sendOTLPLogs(ctx, ld); err != nil {
+	if se.sender.config.LogFormat == OTLPLogFormat {
+		if err := se.sender.sendOTLPLogs(ctx, ld); err != nil {
 			se.handleUnauthorizedErrors(ctx, err)
 			return consumererror.NewLogs(err, ld)
 		}
@@ -285,7 +306,7 @@ func (se *sumologicexporter) pushLogsData(ctx context.Context, ld plog.Logs) err
 
 		currentMetadata := newFields(rl.Resource().Attributes())
 
-		if droppedRecords, err := sdr.sendNonOTLPLogs(ctx, rl, currentMetadata); err != nil {
+		if droppedRecords, err := se.sender.sendNonOTLPLogs(ctx, rl, currentMetadata); err != nil {
 			dropped = append(dropped, droppedResourceRecords{
 				resource: rl.Resource(),
 				records:  droppedRecords,
@@ -323,29 +344,15 @@ func (se *sumologicexporter) pushLogsData(ctx context.Context, ld plog.Logs) err
 // it returns number of unsent metrics and error which contains list of dropped records
 // so they can be handle by the OTC retry mechanism
 func (se *sumologicexporter) pushMetricsData(ctx context.Context, md pmetric.Metrics) error {
-	logsURL, metricsURL, tracesURL := se.getDataURLs()
-	sdr := newSender(
-		se.logger,
-		se.config,
-		se.getHTTPClient(),
-		se.prometheusFormatter,
-		metricsURL,
-		logsURL,
-		tracesURL,
-		se.StickySessionCookie,
-		se.SetStickySessionCookie,
-		se.id,
-	)
-
 	var droppedMetrics pmetric.Metrics
 	var errs []error
-	if sdr.config.MetricFormat == OTLPMetricFormat {
-		if err := sdr.sendOTLPMetrics(ctx, md); err != nil {
+	if se.sender.config.MetricFormat == OTLPMetricFormat {
+		if err := se.sender.sendOTLPMetrics(ctx, md); err != nil {
 			droppedMetrics = md
 			errs = []error{err}
 		}
 	} else {
-		droppedMetrics, errs = sdr.sendNonOTLPMetrics(ctx, md)
+		droppedMetrics, errs = se.sender.sendNonOTLPMetrics(ctx, md)
 	}
 
 	if len(errs) > 0 {
@@ -372,6 +379,12 @@ func (se *sumologicexporter) handleUnauthorizedErrors(ctx context.Context, errs 
 			}
 		}
 	}
+}
+
+func (se *sumologicexporter) pushTracesData(ctx context.Context, td ptrace.Traces) error {
+	err := se.sender.sendTraces(ctx, td)
+	se.handleUnauthorizedErrors(ctx, err)
+	return err
 }
 
 func (se *sumologicexporter) StickySessionCookie() string {
